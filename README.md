@@ -6,7 +6,9 @@ Kova, açık kaynak [yt-dlp](https://github.com/yt-dlp/yt-dlp) motorunun üzerin
 
 ## İndir
 
-Son sürüm her zaman burada: **[github.com/alpunlu12-commits/kova/releases/latest](https://github.com/alpunlu12-commits/kova/releases/latest)**
+En kolay yol: **[unlualp.com/kova](https://unlualp.com/kova/)**. Sayfa bilgisayarına uygun dosyayı öne çıkarır, tek tıkla iner.
+
+Son sürüm her zaman burada da: **[github.com/alpunlu12-commits/kova/releases/latest](https://github.com/alpunlu12-commits/kova/releases/latest)**
 
 | Bilgisayarın | İndireceğin dosya |
 |---|---|
