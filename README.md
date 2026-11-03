@@ -84,7 +84,7 @@ Her sürüm kendi klasörüne iner, bu yüzden güncelleme sırasında süren in
 | İndirilen dosyalar (varsayılan) | `~/Downloads/Kova` | `%USERPROFILE%\Downloads\Kova` |
 | Ayarlar, geçmiş ve bileşenler | `~/Library/Application Support/com.alp.downloader` | `%LOCALAPPDATA%\com.alp.downloader` |
 | Geçici dosyalar | `~/Library/Caches/com.alp.downloader` | `%LOCALAPPDATA%\com.alp.downloader` |
-| Günlük dosyası | yok | `%LOCALAPPDATA%\com.alp.downloader\kova.log` |
+| Günlük dosyası | `~/Library/Logs/com.alp.downloader/kova.log` | `%LOCALAPPDATA%\com.alp.downloader\kova.log` |
 
 Kova'yı tamamen silmek istersen uygulamayı kaldırdıktan sonra bu klasörleri de silebilirsin. İndirdiğin dosyalara dokunulmaz.
 
@@ -95,7 +95,7 @@ Bir sorun görürsen [GitHub Issues](https://github.com/alpunlu12-commits/kova/i
 - Kova sürümü (Ayarlar'da yazar) ve işletim sistemin,
 - ne yaptığın ve ne olduğu, ekranda çıkan hata yazısı,
 - paylaşılabiliyorsa bağlantı,
-- Windows'taysan `kova.log` dosyası (adres yukarıda; dosya 1 MB'ı geçince baştan başlar).
+- `kova.log` dosyası (adres yukarıda; dosya 1 MB'ı geçince baştan başlar).
 
 ## Kullanım notu
 

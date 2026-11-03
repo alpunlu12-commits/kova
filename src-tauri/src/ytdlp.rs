@@ -544,7 +544,15 @@ fn push(a: &mut Vec<OsString>, items: &[&str]) {
 pub fn download_args(req: &DownloadRequest, home: &Path, temp: &Path, square_cover: bool, prefer_av1: bool) -> Vec<OsString> {
     let mut a: Vec<OsString> = Vec::new();
     push(&mut a, &["--no-playlist", "--newline", "--progress", "--no-mtime", "--continue"]);
-    push(&mut a, &["--retries", "5", "--fragment-retries", "5"]);
+    // A dropped connection is retried after a pause that doubles from 1 s
+    // up to 30 s, so a Wi-Fi drop of a few minutes is ridden out in the same
+    // run. Without the pause all retries fail within a second.
+    // Fragments get no pause: a dropped connection inside one is retried by
+    // the HTTP downloader under the pause above, and a missing fragment
+    // (HTTP 404) would otherwise wait three minutes before being skipped.
+    push(&mut a, &["--retries", "10", "--fragment-retries", "10", "--retry-sleep", "http:exp=1:30"]);
+    // Progress at most twice a second; the window shows no more than that.
+    push(&mut a, &["--progress-delta", "0.5"]);
     a.push("-P".into());
     a.push(format!("home:{}", home.display()).into());
     a.push("-P".into());
@@ -631,6 +639,9 @@ pub fn download_args(req: &DownloadRequest, home: &Path, temp: &Path, square_cov
         // As JSON, the path is plain ASCII whatever the console encoding.
         "--print",
         "after_move:KOVAFILE|%(filepath)j",
+        // --print turns yt-dlp quiet, which also hides its "Got error ...
+        // Retrying (2/10)" notices; Kova shows those as a lost connection.
+        "--no-quiet",
         "--",
     ]);
     a.push(OsString::from(&req.url));
@@ -674,7 +685,22 @@ pub enum Line {
     Post { started: bool, name: String },
     File(String),
     Error(String),
+    /// A request failed and yt-dlp is about to try again; `network` is
+    /// false when the site answered with an error instead.
+    Retry { attempt: u32, of: u32, network: bool },
     Other,
+}
+
+/// "[download] Got error: Read timed out.. Retrying (2/10)..." (also
+/// "Retrying fragment 12 (2/10)...") gives (2, 10).
+fn retry_count(line: &str) -> Option<(u32, u32)> {
+    if !(line.starts_with('[') && line.contains("] Got error: ")) {
+        return None;
+    }
+    let rest = &line[line.rfind("Retrying")?..];
+    let inside = &rest[rest.rfind('(')? + 1..];
+    let (n, m) = inside[..inside.find(')')?].split_once('/')?;
+    Some((n.trim().parse().ok()?, m.trim().parse().ok()?))
 }
 
 fn field_u64(s: &str) -> Option<u64> {
@@ -724,6 +750,9 @@ pub fn parse_line(raw: &str) -> Line {
     }
     if let Some(rest) = line.strip_prefix("ERROR:") {
         return Line::Error(rest.trim().to_string());
+    }
+    if let Some((attempt, of)) = retry_count(line) {
+        return Line::Retry { attempt, of, network: !line.to_ascii_lowercase().contains("http error") };
     }
     Line::Other
 }
@@ -801,21 +830,48 @@ pub fn postprocessor_label(name: &str, kind: Kind) -> &'static str {
     }
 }
 
-/// Transient failures worth retrying with fresh URLs.
+/// Transient failures worth retrying with fresh URLs. "Giving up after"
+/// follows yt-dlp's own retries, which only cover connection errors and
+/// 5xx answers.
 pub fn is_retryable(stderr: &str) -> bool {
     let s = stderr.to_ascii_lowercase();
-    ["http error 403", "http error 500", "http error 502", "http error 503", "timed out", "connection reset", "incompleteread", "remote end closed", "temporary failure in name resolution"]
+    is_network_error(&s)
+        || ["http error 403", "http error 500", "http error 502", "http error 503", "giving up after"]
+            .iter()
+            .chain(WINDOWS_LOCKED.iter())
+            .any(|p| s.contains(p))
+}
+
+/// The connection dropped or the network is gone, as opposed to the site
+/// answering with an error.
+pub fn is_network_error(text: &str) -> bool {
+    let s = text.to_ascii_lowercase();
+    ["timed out", "connection reset", "incompleteread", "remote end closed", "temporary failure in name resolution"]
         .iter()
-        .chain(WINDOWS_TRANSIENT.iter())
+        .chain(NETWORK_DOWN.iter())
+        .chain(WINDOWS_NETWORK.iter())
         .any(|p| s.contains(p))
 }
 
-/// How Windows reports a reset or aborted connection, a connect timeout and
-/// a file briefly locked by Defender or the search indexer (WinError 32 and
-/// 5; yt-dlp only writes inside Kova's work folder). Windows words these in
-/// the system language, so the error codes are matched as well as the
-/// English text: "ConnectionResetError(10054, '...')" or "[WinError 10054] ...".
-const WINDOWS_TRANSIENT: [&str; 10] = [
+/// How a missing network shows up while Wi-Fi drops or comes back after
+/// sleep: the name lookup fails ("[Errno 8] nodename nor servname provided"
+/// on macOS) or there is no route yet.
+const NETWORK_DOWN: [&str; 8] = [
+    "failed to resolve",
+    "nodename nor servname",
+    "network is unreachable",
+    "network is down",
+    "no route to host",
+    "connection refused",
+    "connection aborted",
+    "eof occurred in violation of protocol",
+];
+
+/// How Windows reports a reset or aborted connection and a connect timeout.
+/// Windows words these in the system language, so the error codes are
+/// matched as well as the English text: "ConnectionResetError(10054, '...')"
+/// or "[WinError 10054] ...".
+const WINDOWS_NETWORK: [&str; 8] = [
     "forcibly closed by the remote host",
     "did not properly respond",
     "(10054,",
@@ -824,9 +880,11 @@ const WINDOWS_TRANSIENT: [&str; 10] = [
     "[winerror 10053]",
     "(10060,",
     "[winerror 10060]",
-    "[winerror 32]",
-    "[winerror 5]",
 ];
+
+/// A file briefly locked by Defender or the search indexer (yt-dlp only
+/// writes inside Kova's work folder).
+const WINDOWS_LOCKED: [&str; 2] = ["[winerror 32]", "[winerror 5]"];
 
 /// Maps yt-dlp's English error output to short Turkish explanations.
 /// `downloading` only changes the wording of the unmapped fallback.
@@ -876,7 +934,7 @@ pub fn humanize_error(stderr: &str, downloading: bool) -> String {
         "İndirme klasörüne yazılamıyor. Ayarlardan başka bir klasör seç."
     } else if has("requested format is not available") {
         "İstenen kalite bu içerik için mevcut değil. Başka bir kalite seç."
-    } else if has("unable to download webpage") || has("getaddrinfo") || has("nodename nor servname") || has("network is unreachable") || has("timed out") || has("did not properly respond") || has("(10060,") || has("[winerror 10060]") || has("[winerror 10051]") {
+    } else if has("unable to download webpage") || has("getaddrinfo") || has("failed to resolve") || has("nodename nor servname") || has("network is unreachable") || has("network is down") || has("no route to host") || has("timed out") || has("did not properly respond") || has("(10060,") || has("[winerror 10060]") || has("[winerror 10051]") {
         "Siteye ulaşılamadı. İnternet bağlantını kontrol et."
     } else {
         ""
@@ -1041,6 +1099,13 @@ mod tests {
         assert_eq!(parse_line("KOVAFILE|\"\""), Line::Other);
         assert_eq!(parse_line("ERROR: boom"), Line::Error("boom".into()));
         assert_eq!(parse_line("[download] something"), Line::Other);
+        assert_eq!(
+            parse_line("[download] Got error: HTTPSConnectionPool(host='rr1.googlevideo.com', port=443): Read timed out.. Retrying (2/10)..."),
+            Line::Retry { attempt: 2, of: 10, network: true }
+        );
+        assert_eq!(parse_line("[download] Got error: HTTP Error 503. Retrying fragment 12 (1/10)..."), Line::Retry { attempt: 1, of: 10, network: false });
+        assert_eq!(parse_line("[download] Got error: boom (1/2)"), Line::Other);
+        assert_eq!(parse_line("[download] Sleeping 4.00 seconds ..."), Line::Other);
     }
 
     #[test]
@@ -1074,6 +1139,22 @@ mod tests {
         assert!(humanize_error("ERROR: [x] y: This video is DRM protected", true).contains("DRM"));
         assert!(is_retryable("ERROR: unable to download video data: HTTP Error 403: Forbidden"));
         assert!(!is_retryable("ERROR: Private video"));
+    }
+
+    #[test]
+    fn network_drops_are_retried() {
+        // As yt-dlp reported them on macOS while the network was gone.
+        let dns = "ERROR: \r[download] Got error: HTTPSConnectionPool(host='rr3---sn-u0g3uxax3-xncs.googlevideo.com', port=443): Max retries exceeded with url: /videoplayback (Caused by NameResolutionError(\"HTTPSConnection(host='rr3---sn-u0g3uxax3-xncs.googlevideo.com', port=443): Failed to resolve 'rr3---sn-u0g3uxax3-xncs.googlevideo.com' ([Errno 8] nodename nor servname provided, or not known)\")). Giving up after 10 retries";
+        assert!(is_retryable(dns) && humanize_error(dns, true).contains("Siteye ulaşılamadı"));
+        let refused = "ERROR: \r[download] Got error: [Errno 61] Connection refused. Giving up after 10 retries";
+        assert!(is_retryable(refused));
+        let offline_start = "ERROR: [youtube] aqz-KE-bpKQ: Unable to download API page: Failed to resolve 'www.youtube.com' ([Errno 8] nodename nor servname provided, or not known) (caused by TransportError(\"Failed to resolve 'www.youtube.com' ([Errno 8] nodename nor servname provided, or not known)\"))";
+        assert!(is_retryable(offline_start) && humanize_error(offline_start, false).contains("Siteye ulaşılamadı"));
+        assert!(humanize_error("ERROR: [Errno 65] No route to host", true).contains("Siteye ulaşılamadı"));
+        assert!(!is_retryable("ERROR: [youtube] x: Video unavailable"));
+        assert!(is_network_error(dns) && is_network_error(offline_start));
+        assert!(!is_network_error("ERROR: unable to download video data: HTTP Error 403: Forbidden"));
+        assert!(!is_network_error("ERROR: Unable to rename file: [WinError 32] The process cannot access the file"));
     }
 
     #[test]

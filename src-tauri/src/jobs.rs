@@ -6,14 +6,36 @@ use crate::proc::ProcessTree;
 use crate::settings::Kind;
 use crate::ytdlp::{self, DownloadRequest, Line, ProgressTracker, Runner};
 use serde::Serialize;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+/// Runs in a row that brought no new bytes before a job gives up. A run
+/// that moved the download forward does not count.
 const MAX_ATTEMPTS: u32 = 3;
+/// Upper bound on runs per job, however far each of them got.
+const MAX_RUNS: u32 = 8;
+/// Pause before the next run, by how many runs in a row got nothing done.
+const RETRY_WAIT: [u64; 2] = [10, 30];
 const EMIT_INTERVAL: Duration = Duration::from_millis(150);
+/// How often a running job is looked at between lines.
+const TICK: Duration = Duration::from_secs(1);
+/// No progress for this long replaces the last speed with "İnternet bağlantısı bekleniyor".
+const QUIET_HINT: Duration = Duration::from_secs(8);
+/// yt-dlp printed nothing and its files did not grow for this long, so it
+/// is stuck and is started again. While it reads the page and solves the
+/// site's challenges it can be quiet for a while. While downloading, its
+/// read size follows the speed, so it reports progress about every second
+/// and each retry, and one retry (read timeout, pause, connect timeout)
+/// stays well under this.
+/// FFmpeg's work after the download prints nothing and is never cut off.
+const STALL_STARTING: Duration = Duration::from_secs(300);
+const STALL_DOWNLOADING: Duration = Duration::from_secs(180);
+/// After yt-dlp exits, how long a program it started may keep its output
+/// open before Kova stops waiting for the rest.
+const DRAIN: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -94,6 +116,8 @@ struct Job {
     tree: Option<Arc<ProcessTree>>,
     cancel_requested: bool,
     last_emit: Instant,
+    /// A change the throttle held back; `flush` sends it.
+    dirty: bool,
 }
 
 #[derive(Default)]
@@ -318,14 +342,36 @@ impl JobManager {
             }
             if force || job.view.status != before || job.last_emit.elapsed() >= EMIT_INTERVAL {
                 job.last_emit = Instant::now();
+                job.dirty = false;
                 Some(job.view.clone())
             } else {
+                job.dirty = true;
                 None
             }
         };
         if let Some(job) = view {
             self.emit(JobEvent::Update { job });
         }
+    }
+
+    /// Sends the progress change `update` held back, so a download that goes
+    /// quiet does not show an older percentage than it reached.
+    fn flush(&self, id: u64) {
+        let view = {
+            let mut inner = self.lock();
+            let Some(job) = inner.jobs.iter_mut().find(|j| j.view.id == id) else { return };
+            if !job.dirty || job.last_emit.elapsed() < EMIT_INTERVAL {
+                return;
+            }
+            job.dirty = false;
+            job.last_emit = Instant::now();
+            job.view.clone()
+        };
+        self.emit(JobEvent::Update { job: view });
+    }
+
+    fn status_of(&self, id: u64) -> Option<JobStatus> {
+        self.lock().jobs.iter().find(|j| j.view.id == id).map(|j| j.view.status)
     }
 
     pub fn enqueue(self: &Arc<Self>, requests: Vec<DownloadRequest>) -> AppResult<Vec<JobView>> {
@@ -394,7 +440,7 @@ impl JobManager {
                         attempt: 0,
                         batch,
                     };
-                    inner.jobs.push(Job { view: view.clone(), req, dir_from_settings, tree: None, cancel_requested: false, last_emit: Instant::now() });
+                    inner.jobs.push(Job { view: view.clone(), req, dir_from_settings, tree: None, cancel_requested: false, last_emit: Instant::now(), dirty: false });
                     view
                 })
                 .collect()
@@ -432,6 +478,8 @@ impl JobManager {
             let me = Arc::clone(self);
             tauri::async_runtime::spawn(async move { me.run(id).await });
         }
+        // run() calls kick() when a job ends, so this also sees the last one go.
+        crate::platform::keep_awake(self.lock().running > 0);
     }
 
     pub fn cancel(self: &Arc<Self>, id: u64) {
@@ -559,7 +607,7 @@ impl JobManager {
                 attempt: 0,
                 batch,
             };
-            inner.jobs.push(Job { view, req, dir_from_settings: false, tree: None, cancel_requested: false, last_emit: Instant::now() });
+            inner.jobs.push(Job { view, req, dir_from_settings: false, tree: None, cancel_requested: false, last_emit: Instant::now(), dirty: false });
         }
     }
 
@@ -641,8 +689,15 @@ impl JobManager {
             return Outcome::Failed(format!("Geçici klasör oluşturulamadı. {}", crate::util::io_text(&e)));
         }
 
-        let mut last_error = String::new();
-        for attempt in 1..=MAX_ATTEMPTS {
+        let mut last_error;
+        let mut stalled;
+        // The furthest each stream got over all runs of this job, to tell a
+        // run that moved the download forward from one that did nothing.
+        let mut best: HashMap<String, u64> = HashMap::new();
+        let mut fruitless = 0;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
             if self.is_cancel_requested(id) {
                 return Outcome::Canceled;
             }
@@ -650,8 +705,11 @@ impl JobManager {
                 job.view.attempt = attempt;
                 job.view.status = JobStatus::Starting;
                 job.view.progress = None;
+                job.view.speed = None;
+                job.view.eta = None;
                 job.view.stage = Some(if attempt > 1 { "Yeniden deneniyor" } else { "Hazırlanıyor" }.into());
             });
+            log(id, &format!("run {attempt} started"));
 
             let mut cmd = runner.command();
             cmd.args(ytdlp::download_args(&req, &job_out, &job_parts, options.square_cover, options.prefer_av1));
@@ -692,11 +750,23 @@ impl JobManager {
             let mut files: Vec<String> = Vec::new();
             let mut ignored: Vec<String> = Vec::new();
             let mut tail: VecDeque<String> = VecDeque::new();
+            let mut silence = Silence::new([job_out.clone(), job_parts.clone()]);
+            let mut last_progress = Instant::now();
+            let mut hinted = false;
+            let mut advanced = false;
+            stalled = false;
+            let mut exited = None;
+            let mut drain_until: Option<Instant> = None;
+            let mut tick = tokio::time::interval(TICK);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             while out_open || err_open {
-                tokio::select! {
+                let heard = tokio::select! {
                     segment = out.next_segment(), if out_open => match segment {
                         Ok(Some(bytes)) => self.handle_line(id, &String::from_utf8_lossy(&bytes), &mut tracker, &mut files),
-                        _ => out_open = false,
+                        _ => {
+                            out_open = false;
+                            continue;
+                        }
                     },
                     segment = err.next_segment(), if err_open => match segment {
                         Ok(Some(bytes)) => {
@@ -709,13 +779,83 @@ impl JobManager {
                             }
                             // "--print" output only ever goes to stdout; a file
                             // marker on stderr is never trusted.
-                            self.handle_line(id, &l, &mut tracker, &mut ignored);
+                            self.handle_line(id, &l, &mut tracker, &mut ignored)
                         }
-                        _ => err_open = false,
+                        _ => {
+                            err_open = false;
+                            continue;
+                        }
                     },
+                    // yt-dlp ended, but FFmpeg or Deno may still hold the
+                    // pipes; the rest of the output gets a moment to arrive.
+                    status = child.wait(), if exited.is_none() => {
+                        exited = Some(status);
+                        drain_until = Some(Instant::now() + DRAIN);
+                        continue;
+                    }
+                    _ = tick.tick() => {
+                        self.flush(id);
+                        if drain_until.is_some_and(|until| Instant::now() >= until) {
+                            if let Some(tree) = &tree {
+                                tree.kill();
+                            }
+                            break;
+                        }
+                        if self.is_cancel_requested(id) || stalled {
+                            continue;
+                        }
+                        let status = self.status_of(id);
+                        if status == Some(JobStatus::Downloading) && !hinted && last_progress.elapsed() >= QUIET_HINT {
+                            hinted = true;
+                            self.update(id, true, |job| {
+                                if job.cancel_requested || job.view.status != JobStatus::Downloading {
+                                    return;
+                                }
+                                let v = &mut job.view;
+                                v.speed = None;
+                                v.eta = None;
+                                v.stage = Some("İnternet bağlantısı bekleniyor".into());
+                            });
+                        }
+                        let limit = match status {
+                            Some(JobStatus::Starting) => STALL_STARTING,
+                            Some(JobStatus::Downloading) => STALL_DOWNLOADING,
+                            _ => continue,
+                        };
+                        let quiet = silence.quiet_for();
+                        if quiet >= limit {
+                            stalled = true;
+                            log(id, &format!("no output and no new bytes for {} s, stopping yt-dlp", quiet.as_secs()));
+                            if let Some(tree) = &tree {
+                                tree.kill();
+                            }
+                        }
+                        continue;
+                    }
+                };
+                silence.heard();
+                match heard {
+                    Heard::Progress { format_id, downloaded } => {
+                        last_progress = Instant::now();
+                        hinted = false;
+                        let furthest = best.entry(format_id).or_insert(0);
+                        if downloaded > *furthest {
+                            *furthest = downloaded;
+                            advanced = true;
+                        }
+                    }
+                    Heard::Retry(line) => {
+                        // The retry notice stays up until progress resumes.
+                        hinted = true;
+                        log(id, &line);
+                    }
+                    Heard::Other => {}
                 }
             }
-            let status = child.wait().await;
+            let status = match exited {
+                Some(status) => status,
+                None => child.wait().await,
+            };
             if let Some(job) = self.lock().jobs.iter_mut().find(|j| j.view.id == id) {
                 job.tree = None;
             }
@@ -749,28 +889,79 @@ impl JobManager {
                 };
             }
             last_error = stderr_text;
-            if attempt < MAX_ATTEMPTS && ytdlp::is_retryable(&last_error) {
-                tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
-                continue;
+            // The last lines yt-dlp wrote, for kova.log (the window shows them in plain Turkish).
+            let last_lines: Vec<&str> = last_error.lines().rev().take(12).collect();
+            let exit = status.map_or_else(|e| e.to_string(), |s| s.to_string());
+            log(id, &format!("run {attempt} failed ({exit}), yt-dlp said:\n{}", last_lines.into_iter().rev().collect::<Vec<_>>().join("\n")));
+            fruitless = if advanced { 0 } else { fruitless + 1 };
+            if !(stalled || ytdlp::is_retryable(&last_error)) || fruitless >= MAX_ATTEMPTS || attempt >= MAX_RUNS {
+                break;
             }
-            break;
+            // A run that got further is resumed at once; one that got
+            // nothing waits longer each time for the network to come back.
+            let wait = if advanced { 2 } else { RETRY_WAIT[(fruitless as usize - 1).min(RETRY_WAIT.len() - 1)] };
+            let network = stalled || ytdlp::is_network_error(&last_error);
+            // The status stays as it was, so the bar, the menu bar bucket and
+            // the Dock keep the percentage until the next run starts.
+            self.update(id, true, |job| {
+                if job.cancel_requested {
+                    return;
+                }
+                let v = &mut job.view;
+                v.speed = None;
+                v.eta = None;
+                v.stage = Some(if network { "İnternet bağlantısı bekleniyor" } else { "Birazdan yeniden denenecek" }.into());
+            });
+            if !self.pause(id, Duration::from_secs(wait)).await {
+                return Outcome::Canceled;
+            }
         }
-        // The last lines yt-dlp wrote, for kova.log (the window shows them in plain Turkish).
-        let last_lines: Vec<&str> = last_error.lines().rev().take(12).collect();
-        eprintln!("[kova] download {id}: yt-dlp said:\n{}", last_lines.into_iter().rev().collect::<Vec<_>>().join("\n"));
+        if stalled {
+            return Outcome::Failed("İndirme ilerlemiyor; bağlantı çok yavaş ya da kopmuş olabilir. Tekrar dene, kaldığı yerden devam eder.".into());
+        }
         if req.kind == Kind::Webm && last_error.to_lowercase().contains("requested format is not available") {
             return Outcome::Failed("Bu site WEBM sunmuyor. MKV ya da MP4 seç.".into());
         }
         Outcome::Failed(ytdlp::humanize_error(&last_error, true))
     }
 
-    fn handle_line(&self, id: u64, line: &str, tracker: &mut ProgressTracker, files: &mut Vec<String>) {
+    /// Waits before the next run. False when the job was canceled (or Kova
+    /// is quitting) in the meantime.
+    async fn pause(&self, id: u64, wait: Duration) -> bool {
+        let until = Instant::now() + wait;
+        loop {
+            if self.is_cancel_requested(id) || self.lock().closing {
+                return false;
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return true;
+            }
+            tokio::time::sleep(left.min(Duration::from_millis(250))).await;
+        }
+    }
+
+    fn handle_line(&self, id: u64, line: &str, tracker: &mut ProgressTracker, files: &mut Vec<String>) -> Heard {
         match ytdlp::parse_line(line) {
             Line::Meta { parts } => tracker.set_parts(parts),
             // Subtitle files are fetched before the media and report no
             // format id; they would flash the bar to 99% and back.
             Line::Progress { format_id, .. } if format_id.is_empty() && tracker.part_count() == 0 => {}
+            Line::Retry { attempt, of, network } => {
+                let what = if network { "Bağlantı koptu" } else { "Site hata verdi" };
+                self.update(id, true, |job| {
+                    if job.cancel_requested || !job.view.status.is_active() {
+                        return;
+                    }
+                    let v = &mut job.view;
+                    v.speed = None;
+                    v.eta = None;
+                    v.stage = Some(format!("{what}, yeniden deneniyor ({attempt}/{of})"));
+                });
+                return Heard::Retry(line.trim().to_string());
+            }
             Line::Progress { finished, downloaded, total, speed, eta, format_id } => {
+                let heard = Heard::Progress { format_id: format_id.clone(), downloaded: downloaded.unwrap_or(0) };
                 let fraction = tracker.update(finished, &format_id, downloaded, total);
                 let stage = if tracker.part_count() >= 2 {
                     match tracker.part_index(&format_id) {
@@ -792,6 +983,7 @@ impl JobManager {
                     v.eta = eta;
                     v.stage = Some(stage.into());
                 });
+                return heard;
             }
             Line::Post { started: true, name } => {
                 self.update(id, true, |job| {
@@ -816,7 +1008,66 @@ impl JobManager {
             }
             _ => {}
         }
+        Heard::Other
     }
+}
+
+/// What a line of yt-dlp output meant for the read loop.
+enum Heard {
+    Progress { format_id: String, downloaded: u64 },
+    Retry(String),
+    Other,
+}
+
+/// Notices when yt-dlp has gone quiet: no line of output and no growth of
+/// the files in the job's folders (FFmpeg as a downloader writes without
+/// printing lines).
+struct Silence {
+    dirs: [PathBuf; 2],
+    last_activity: Instant,
+    bytes: u64,
+    checked: Instant,
+}
+
+impl Silence {
+    fn new(dirs: [PathBuf; 2]) -> Self {
+        let bytes = folder_bytes(&dirs);
+        Silence { dirs, last_activity: Instant::now(), bytes, checked: Instant::now() }
+    }
+
+    fn heard(&mut self) {
+        self.last_activity = Instant::now();
+    }
+
+    /// How long nothing has happened. The folders are only looked at once
+    /// the output has been quiet for a few seconds.
+    fn quiet_for(&mut self) -> Duration {
+        const LOOK_EVERY: Duration = Duration::from_secs(5);
+        if self.last_activity.elapsed() >= LOOK_EVERY && self.checked.elapsed() >= LOOK_EVERY {
+            self.checked = Instant::now();
+            let bytes = folder_bytes(&self.dirs);
+            if bytes != self.bytes {
+                self.bytes = bytes;
+                self.last_activity = Instant::now();
+            }
+        }
+        self.last_activity.elapsed()
+    }
+}
+
+fn folder_bytes(dirs: &[PathBuf]) -> u64 {
+    dirs.iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flatten()
+        .filter_map(|e| e.ok()?.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// A line for kova.log with the time, so a stuck download can be traced.
+fn log(id: u64, text: &str) {
+    eprintln!("[kova] {} download {id}: {text}", crate::util::log_time());
 }
 
 #[cfg(test)]

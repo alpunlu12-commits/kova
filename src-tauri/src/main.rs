@@ -132,6 +132,11 @@ fn main() {
             let data_dir = paths.app_local_data_dir()?;
             #[cfg(all(windows, not(debug_assertions)))]
             platform::log_to_file(&data_dir.join("kova.log"));
+            // ~/Library/Logs/com.alp.downloader, where Console.app looks.
+            #[cfg(all(target_os = "macos", not(debug_assertions)))]
+            if let Ok(dir) = paths.app_log_dir() {
+                platform::log_to_file(&dir.join("kova.log"));
+            }
             let cache_dir = paths.app_cache_dir()?;
             let downloads = paths
                 .download_dir()

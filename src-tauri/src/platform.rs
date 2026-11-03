@@ -50,7 +50,7 @@ pub mod quit {
     const TERMINATE_NOW: usize = 1;
     const FIRST_BUTTON: isize = 1000;
 
-    fn ns_string(text: &str) -> Option<Retained<AnyObject>> {
+    pub(super) fn ns_string(text: &str) -> Option<Retained<AnyObject>> {
         let c = CString::new(text.replace('\0', "")).ok()?;
         unsafe { msg_send![class!(NSString), stringWithUTF8String: c.as_ptr()] }
     }
@@ -138,6 +138,45 @@ pub mod quit {
         }
     }
 }
+
+/// While downloads run, keeps the Mac from going to sleep on its own and
+/// keeps App Nap from slowing Kova down once its window is closed. The
+/// display may still turn off, and closing the lid still puts the Mac to
+/// sleep. Cheap to call again with the same value.
+#[cfg(target_os = "macos")]
+pub fn keep_awake(on: bool) {
+    use objc2::rc::{autoreleasepool, Retained};
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use std::sync::Mutex;
+
+    struct Activity(Retained<AnyObject>);
+    // SAFETY: the token is only handed back to NSProcessInfo, which may be
+    // used from any thread.
+    unsafe impl Send for Activity {}
+    static ACTIVITY: Mutex<Option<Activity>> = Mutex::new(None);
+    // NSActivityUserInitiated, which includes NSActivityIdleSystemSleepDisabled.
+    const USER_INITIATED: u64 = 0x00FF_FFFF;
+
+    let mut held = ACTIVITY.lock().unwrap_or_else(|p| p.into_inner());
+    if on == held.is_some() {
+        return;
+    }
+    autoreleasepool(|_| unsafe {
+        let info: *mut AnyObject = msg_send![class!(NSProcessInfo), processInfo];
+        if on {
+            // Shown by `pmset -g assertions`, which mangles non-ASCII text.
+            let Some(reason) = quit::ns_string("Kova is downloading") else { return };
+            let token: Option<Retained<AnyObject>> = msg_send![info, beginActivityWithOptions: USER_INITIATED, reason: &*reason];
+            *held = token.map(Activity);
+        } else if let Some(Activity(token)) = held.take() {
+            let _: () = msg_send![info, endActivity: &*token];
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn keep_awake(_on: bool) {}
 
 /// The static FFmpeg build cannot find the system certificate store on its
 /// own; macOS keeps a PEM bundle here. The Windows build uses the system's
@@ -236,16 +275,14 @@ pub mod tray_menu {
     }
 }
 
-/// Windows: a release build has no console, so what Kova prints for
+/// A release build writes standard error nowhere (no console on Windows, and
+/// a Mac app opened from Finder has none either), so what Kova prints for
 /// troubleshooting ("[kova] ..." lines, a failed download's yt-dlp output)
 /// goes to this file instead, which can be sent along with a bug report.
 /// It starts over once it is larger than 1 MB. Development runs keep
 /// printing to the terminal.
-#[cfg(all(windows, not(debug_assertions)))]
+#[cfg(not(debug_assertions))]
 pub fn log_to_file(path: &Path) {
-    use std::os::windows::io::IntoRawHandle;
-    use windows_sys::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE};
-
     let _ = std::fs::create_dir_all(path.parent().unwrap_or(path));
     let fresh = std::fs::metadata(path).map_or(true, |m| m.len() > 1_000_000);
     let mut options = std::fs::OpenOptions::new();
@@ -256,11 +293,29 @@ pub fn log_to_file(path: &Path) {
         options.append(true);
     }
     let Ok(file) = options.open(path) else { return };
-    // SAFETY: the handle is an open file that is never closed, so it stays
-    // valid as standard error until Kova exits. Rust's stderr looks the
-    // handle up on every write, so all later output lands in the file.
-    unsafe { SetStdHandle(STD_ERROR_HANDLE, file.into_raw_handle()) };
-    eprintln!("[kova] {} started at {} (windows {})", env!("CARGO_PKG_VERSION"), crate::util::now_secs(), std::env::consts::ARCH);
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::IntoRawHandle;
+        use windows_sys::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE};
+        // SAFETY: the handle is an open file that is never closed, so it stays
+        // valid as standard error until Kova exits. Rust's stderr looks the
+        // handle up on every write, so all later output lands in the file.
+        unsafe { SetStdHandle(STD_ERROR_HANDLE, file.into_raw_handle()) };
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: both are open descriptors; dup2 makes 2 a second handle on
+        // the file, which stays open after `file` is dropped.
+        unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) };
+    }
+    eprintln!(
+        "[kova] {} started at {} ({} {})",
+        env!("CARGO_PKG_VERSION"),
+        crate::util::log_time(),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
 }
 
 #[cfg(test)]
